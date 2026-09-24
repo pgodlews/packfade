@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "packfade"
+version = "0.1.0"
+description = "Packfade: Local-first e-bike pack fade from Garmin FIT files."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Piotr Godlewski" }]
+requires-python = ">=3.12"
+dependencies = [
+    "garmin-fit-sdk==21.217.0",
+    "numpy==2.5.3",
+    "scikit-learn==1.9.1",
+    "matplotlib==3.11.2",
+    "scipy==1.18.1"
+]
+
+[project.scripts]
+packfade = "packfade.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["packfade*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

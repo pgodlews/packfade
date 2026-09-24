@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+build/
+data/
+reports/
+models/
+*.fit
+*.FIT
+*.npz
+*.png
+!docs/images/*.png
+.claude/

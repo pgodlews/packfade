@@ -170,7 +170,7 @@ PYTHONPATH=. .venv/bin/python scripts/serve_web.py
 1. **Import Rides**: Drag and drop Garmin `.fit` files onto the page, pick a folder, or (Option 3) click **"Sync USB Edge"**.
 2. **Explore the Demo**: The anonymised 96-ride demo loads on first visit (red **Demo mode** banner). Importing your own files offers to start a clean Personal Pack.
 3. **Toggle Units**: Switch between Kilometers and Miles using the `[KM | MI]` header toggle.
-4. **Export Reports**: Export PNG charts or backup your database as JSON with one click.
+4. **Export Reports**: Export PNG charts or back up your database as JSON with one click. The backup includes your bike settings and ride selections, so restoring it in another browser gives the same analysis. Truncated or corrupt `.fit` files are rejected on import (FIT CRC check), never imported as shorter rides.
 
 ---
 

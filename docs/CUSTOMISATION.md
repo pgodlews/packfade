@@ -336,15 +336,21 @@ Then adjust:
 
 ## 10. What still shows the reference bike's data
 
-At the time of writing, some views ignore your imported data and always show the reference bike's numbers. Hide them or rebuild them before presenting results for another bike:
+At the time of writing, some static text in the HTML still describes the reference bike. Change or hide it before presenting results for another bike:
 
-- **Charging Habits chart** (`drawChargingChart`): fixed histogram bins
-- **Storage Idle Sag chart and tooltip** (`drawIdleChart`, the idle branch of `handleChartHover`): fixed medians and maxima
-- **Storage Idle Sag KPI** (`kpiIdleDrop`): always `0.0`
-- **Insights panel** (`.insights-card` in the HTML): static text with reference-bike figures
-- **Static text in the HTML**: "Garmin Edge 1040", "Nominal 720 Wh Simplo", "Yamaha PW-X3 assist level", and the placeholder KPI values
+- "Garmin Edge 1040", "Nominal 720 Wh Simplo", "Yamaha PW-X3 assist level", and the placeholder KPI values
 
-The browser has no charging or idle-gap analysis yet; only the Python prototype (`scripts/analyze_ebike_charging.py`) computes it. Porting `classify_gap` and `intervals()` to JS would make these views real for any bike.
+The charging, idle-gap and quarterly views are computed from your own rides. Every import, and every USB bridge merge, rebuilds them in the browser with `buildChargingSummary` and `buildQuarterly`. These are ports of `summarize()` in `scripts/analyze_ebike_charging.py` and `quarterly_summary()` in `scripts/analyze_ebike_battery.py`. The charging analysis needs per-recording SOC endpoints (`charging.endpoints`), which `chargingEndpointFromRecords` computes from each FIT file. A ride stored before endpoints existed has none. It breaks the charging chain, like a recording without SOC, until you import its file again.
+
+Their thresholds are analysis choices, not manufacturer values. Change each one in both engines:
+
+| Rule | Value | JS | Python |
+|---|---|---|---|
+| Likely charge / possible top-up / ambiguous gain | ≥ 10 / ≥ 5 / > 1 pp | `classifyGap` | `classify_gap` (`packfade/battery_history.py`) |
+| Within reporting resolution | ±1 pp | `classifyGap` | `classify_gap` |
+| Endpoint window | 30 s | `chargingEndpointFromRecords` | `extract()` in `analyze_ebike_charging.py` |
+| Usable endpoint: first/last SOC at most this far from the recording start/end | 60 s | `chargingEndpointFromRecords` | `extract()` in `analyze_ebike_charging.py` |
+| Usable endpoint: largest SOC spread within the window | 2 pp | `chargingEndpointFromRecords` | `extract()` in `analyze_ebike_charging.py` |
 
 ### Python prototype (optional)
 
@@ -379,7 +385,7 @@ If you use the headless scripts, also change:
 - [ ] Filter thresholds reviewed for your pack size, identical in JS and Python
 - [ ] Chart ranges fit your pp/km
 - [ ] Simulator re-derived or hidden
-- [ ] Views that still show reference-bike data (section 10) hidden or rebuilt
+- [ ] Reference-bike text (section 10) changed or hidden; charging thresholds reviewed
 - [ ] Tests added with synthetic data; full suite passes
 - [ ] No personal FIT, CSV or JSON data, timestamps or hashes committed
 

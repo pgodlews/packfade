@@ -4,6 +4,8 @@ import struct
 import subprocess
 import tempfile
 
+from synthetic_fit import fit_file
+
 
 def make_synthetic_fit(lead_without_battery=0):
     """Generate a valid binary FIT activity containing e-bike telemetry and a bracketed 50% glitch.
@@ -19,10 +21,6 @@ def make_synthetic_fit(lead_without_battery=0):
         (73, 4, 134),   # enhanced_speed in mm/s (u32, 4B)
         (119, 1, 2),    # assist mode (u8, 1B)
     ]
-    def_msg = bytearray([0x40, 0, 0, 20, 0, len(fields)])
-    for f_num, size, b_type in fields:
-        def_msg.extend([f_num, size, b_type])
-
     records_data = bytearray()
     t0 = 1000000000
     for j in range(lead_without_battery):
@@ -47,9 +45,7 @@ def make_synthetic_fit(lead_without_battery=0):
         records_data.append(0x00)  # Data record, local msg 0
         records_data.extend(struct.pack('<IIBbIB', t, dist_cm, soc, temp, spd_mms, mode))
 
-    data = def_msg + records_data
-    header = bytearray([14, 0x10, 0, 0]) + struct.pack('<I', len(data)) + b'.FIT\x00\x00'
-    return bytes(header + data)
+    return fit_file(records_data, fields)
 
 
 def test_browser_js_fit_parser_and_glitch_mask():

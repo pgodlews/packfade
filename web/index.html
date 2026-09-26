@@ -1976,7 +1976,8 @@ function fitModelClient(rides, options = {}) {
     origin = isFinite(minDate) ? minDate : new Date('2025-03-26').getTime();
   }
   const maxDate = Math.max(...dates);
-  const durationYears = Math.max(0.1, (maxDate - origin) / (365.25 * 86400 * 1000));
+  // Capacity is reported at the last included ride, never extrapolated past it (as in fit_trend()).
+  const durationYears = (maxDate - origin) / (365.25 * 86400 * 1000);
 
   const useEfc = options.timeVariable === 'efc';
   const useWls = options.useWls !== false;
@@ -2242,19 +2243,22 @@ async function toggleRideInclusion(date, isChecked) {
   await recomputeModelFromInclusions();
 }
 
+// The ride table and "select all" share this, so the checkbox acts on exactly the rows shown.
+function rideMatchesSearch(r, query) {
+  if (!query) return true;
+  const isOrigClean = !r.reasons || r.reasons.length === 0;
+  const reasonStr = (r.reasons || []).join(' ');
+  const searchTarget = `${r.date.slice(0, 10)} ${reasonStr} ${isOrigClean ? 'clean usable' : 'excluded'} ${isRideIncluded(r) ? 'included' : ''}`.toLowerCase();
+  return searchTarget.includes(query);
+}
+
 async function toggleSelectAll(isChecked) {
   if (!currentData || !currentData.analysis) return;
   const rides = currentData.analysis.per_ride || [];
   const query = searchFilter.toLowerCase().trim();
-
-  for (const r of rides) {
-    const dateStr = r.date.slice(0, 10);
-    const reasonStr = (r.reasons || []).join(' ').toLowerCase();
-    const isClean = !r.reasons || r.reasons.length === 0;
-    const statusText = isClean ? 'usable clean' : reasonStr;
-    if (query && !dateStr.includes(query) && !statusText.includes(query)) {
-      continue;
-    }
+  // Decide the visible rows first: changing inclusions changes which rows match "included".
+  const visible = rides.filter(r => rideMatchesSearch(r, query));
+  for (const r of visible) {
     userInclusions[rideKey(r)] = isChecked;
   }
   await recomputeModelFromInclusions();
@@ -2392,6 +2396,283 @@ async function recomputeModelFromInclusions() {
   await idbSet('ebike_data', currentData);
 
   renderDashboard();
+}
+
+/* ────────────── Derived Analytics: Quarterly, Charging & Idle Gaps ────────────── */
+// Browser ports of quarterly_summary() (scripts/analyze_ebike_battery.py) and of classify_gap(),
+// intervals() and summarize() (packfade/battery_history.py, scripts/analyze_ebike_charging.py).
+// numpy.percentile with linear interpolation, on sorted values
+function percentileSorted(sorted, p) {
+  const pos = (sorted.length - 1) * p / 100;
+  const lo = Math.floor(pos), hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+function describeValues(values) {
+  if (!values.length) return null;
+  const s = [...values].sort((a, b) => a - b);
+  return {
+    n: s.length, min: s[0], q25: percentileSorted(s, 25), median: percentileSorted(s, 50),
+    q75: percentileSorted(s, 75), max: s[s.length - 1], mean: s.reduce((a, b) => a + b, 0) / s.length
+  };
+}
+
+// Medians per calendar quarter (UTC) over clean rides, in ride order.
+function buildQuarterly(rides) {
+  const groups = new Map();
+  for (const r of rides) {
+    if (r.reasons && r.reasons.length) continue;
+    const d = new Date(r.date);
+    const label = `${d.getUTCFullYear()} Q${Math.floor(d.getUTCMonth() / 3) + 1}`;
+    if (!groups.has(label)) groups.set(label, []);
+    groups.get(label).push(r);
+  }
+  return Array.from(groups, ([period, rs]) => ({
+    period,
+    rides: rs.length,
+    median_pp_per_km: median(rs.map(r => r.pp_per_km)),
+    median_equivalent_range_km: median(rs.map(r => r.equivalent_range_km)),
+    median_temperature_c: median(rs.map(r => r.temperature_c)),
+    median_mode7_fraction: median(rs.map(r => r.mode7_fraction))
+  }));
+}
+
+// Adjacent recordings only. A recording missing SOC is a hard barrier.
+function classifyGap(previous, following) {
+  if (previous.end_soc == null || following.start_soc == null) return 'unknown_missing_endpoint';
+  if (previous.end_quality !== 'usable' || following.start_quality !== 'usable') return 'unknown_endpoint_quality';
+  const delta = following.start_soc - previous.end_soc;
+  if (delta >= 10) return 'likely_charge_large_gain';
+  if (delta >= 5) return 'possible_top_up';
+  if (delta > 1) return 'ambiguous_small_gain';
+  if (delta >= -1) return 'within_one_point';
+  return 'apparent_idle_drop';
+}
+
+// Charging and idle-gap summary over every ride, from the per-recording SOC endpoints.
+function buildChargingSummary(rides, endpoints) {
+  const byKey = new Map((endpoints || []).map(e => [rideKey(e.record_start), e]));
+  // A ride without endpoint data (e.g. stored before endpoints were recorded) breaks the chain
+  // instead of being bridged, as a recording without SOC does in the Python analysis.
+  const chain = rides.map(r => byKey.get(rideKey(r)) ||
+    { id: r.date, record_start: r.date, start_soc: null, end_soc: null, start_quality: 'missing', end_quality: 'missing' });
+
+  const gaps = [];
+  for (let i = 1; i < chain.length; i++) {
+    const a = chain[i - 1], b = chain[i];
+    const row = { previous_id: a.id, next_id: b.id, previous_ride: a.record_start, next_ride: b.record_start,
+                  classification: classifyGap(a, b) };
+    if (a.end_soc != null && b.start_soc != null) {
+      const hours = (Date.parse(b.start_observed_at) - Date.parse(a.end_observed_at)) / 3.6e6;
+      Object.assign(row, {
+        gap_hours: hours, gap_days: hours / 24, before_soc: a.end_soc, after_soc: b.start_soc,
+        net_gain_pp: b.start_soc - a.end_soc, apparent_drop_pp: a.end_soc - b.start_soc,
+        previous_temperature_c: a.end_temperature_c ?? null, next_temperature_c: b.start_temperature_c ?? null
+      });
+      if (a.end_temperature_c != null && b.start_temperature_c != null) {
+        row.temperature_change_c = b.start_temperature_c - a.end_temperature_c;
+      }
+      if (hours <= 0) row.classification = 'unknown_overlapping_recordings';
+    }
+    gaps.push(row);
+  }
+
+  const charge = gaps.filter(g => g.classification === 'likely_charge_large_gain');
+  const idle = gaps.filter(g => g.classification === 'within_one_point' || g.classification === 'apparent_idle_drop');
+  const gapCounts = {};
+  gaps.forEach(g => { gapCounts[g.classification] = (gapCounts[g.classification] || 0) + 1; });
+  const recorded = chain.filter(e => byKey.get(rideKey(e.record_start)) === e);
+  const idleDrops = idle.map(g => g.apparent_drop_pp);
+  return {
+    recordings: chain.length,
+    date_range: chain.length ? [chain[0].record_start.slice(0, 10), chain[chain.length - 1].record_start.slice(0, 10)] : null,
+    gap_counts: gapCounts,
+    masked_50_samples: recorded.reduce((a, e) => a + (e.glitch_samples_masked || 0), 0),
+    rides_with_masked_50_samples: recorded.filter(e => (e.glitch_samples_masked || 0) > 0).length,
+    residual_rise_rides: recorded.filter(e => (e.residual_soc_rises_at_least_3pp || 0) > 0).length,
+    likely_charges: {
+      count: charge.length,
+      pre_gap_soc: describeValues(charge.map(g => g.before_soc)),
+      next_ride_soc: describeValues(charge.map(g => g.after_soc)),
+      gain_pp: describeValues(charge.map(g => g.net_gain_pp)),
+      next_ride_at_least_95: charge.filter(g => g.after_soc >= 95).length,
+      next_ride_at_least_99: charge.filter(g => g.after_soc >= 99).length,
+      pre_gap_at_most_30: charge.filter(g => g.before_soc <= 30).length,
+      pre_gap_over_50: charge.filter(g => g.before_soc > 50).length,
+      gap_hours: describeValues(charge.map(g => g.gap_hours))
+    },
+    possible_topups: gaps.filter(g => g.classification === 'possible_top_up'),
+    idle: {
+      count: idle.length,
+      drop_pp: describeValues(idleDrops),
+      exactly_unchanged: idleDrops.filter(d => d === 0).length,
+      within_one_point: idleDrops.filter(d => Math.abs(d) <= 1).length,
+      drops_at_least_5: idleDrops.filter(d => d >= 5).length,
+      sum_apparent_drop_pp: idleDrops.reduce((a, b) => a + b, 0),
+      duration_bands: [[0, 1, 'Under 1 day'], [1, 3, '1–3 days'], [3, 7, '3–7 days'], [7, 30, '7–30 days'], [30, Infinity, 'Over 30 days']]
+        .map(([lo, hi, label]) => ({
+          label,
+          statistics: describeValues(idle.filter(g => g.gap_days >= lo && g.gap_days < hi).map(g => g.apparent_drop_pp))
+        })),
+      largest_drops: [...idle].sort((a, b) => b.apparent_drop_pp - a.apparent_drop_pp).slice(0, 8)
+    },
+    endpoints: recorded,
+    gaps
+  };
+}
+
+// Recompute everything derived from the ride list (cumulative discharge, quarterly medians, charging
+// and idle gaps) so that adding rides never leaves these views stale or empty.
+function rebuildDerivedAnalytics(endpoints) {
+  const analysis = currentData.analysis;
+  const rides = analysis.per_ride.sort((a, b) => new Date(a.date) - new Date(b.date));
+  let cumDrop = 0;
+  for (const r of rides) {
+    if (!r.reasons || r.reasons.length === 0) {
+      cumDrop += r.drop_pp;
+      r.cumulative_drop_pp = cumDrop;
+      r.cumulative_efc = cumDrop / 100.0;
+    } else {
+      r.cumulative_drop_pp = null;
+      r.cumulative_efc = null;
+    }
+  }
+  analysis.rides_imported = rides.length;
+  analysis.rides_usable = rides.filter(r => !r.reasons || r.reasons.length === 0).length;
+  analysis.quarterly = buildQuarterly(rides);
+  currentData.charging = buildChargingSummary(rides, endpoints);
+}
+
+/* ────────────── Backup & Bridge Data Validation ────────────── */
+// Everything loaded from a JSON backup or the USB bridge is checked field by field: dates and ids must
+// look like dates and ids, everything else must be a number or null. A crafted file cannot smuggle
+// markup into the page or strings into numeric fields.
+const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/;
+const IDENTIFIER_RE = /^[A-Za-z0-9_.:+-]{1,128}$/;
+
+function checkedValue(value, kind, where) {
+  if (value == null) return null;
+  const ok = kind === 'number' ? (typeof value === 'number' && Number.isFinite(value))
+    : kind === 'datetime' ? (typeof value === 'string' && ISO_DATETIME_RE.test(value) && !isNaN(Date.parse(value)))
+    : kind === 'identifier' ? (typeof value === 'string' && IDENTIFIER_RE.test(value))
+    : Array.isArray(kind) ? kind.includes(value)
+    : false;
+  if (!ok) throw new Error(`${where} has an invalid value`);
+  return value;
+}
+
+// Copies fields listed in `schema` ({field: kind}); every other field must be a finite number or null.
+function checkedRecord(obj, schema, where) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error(`${where} is not an object`);
+  const out = {};
+  for (const [key, value] of Object.entries(obj)) {
+    out[key] = checkedValue(value, schema[key] || 'number', `${where}.${key}`);
+  }
+  return out;
+}
+
+function sanitizeDataset(data) {
+  if (!data || typeof data !== 'object' || !data.analysis || !Array.isArray(data.analysis.per_ride)) {
+    throw new Error('not a Packfade dataset (analysis.per_ride is missing)');
+  }
+  const perRide = data.analysis.per_ride.map((r, i) => {
+    const where = `ride ${i + 1}`;
+    const { reasons, ...rest } = r && typeof r === 'object' ? r : {};
+    const ride = checkedRecord(rest, { date: 'datetime' }, where);
+    if (!ride.date) throw new Error(`${where} has no date`);
+    if (reasons != null && (!Array.isArray(reasons) || !reasons.every(x => typeof x === 'string' && /^[a-z0-9_]{1,64}$/.test(x)))) {
+      throw new Error(`${where}.reasons has an invalid value`);
+    }
+    ride.reasons = reasons || [];
+    return ride;
+  });
+
+  const quality = ['usable', 'uncertain', 'missing'];
+  const endpointSchema = { id: 'identifier', record_start: 'datetime', record_end: 'datetime',
+    start_observed_at: 'datetime', end_observed_at: 'datetime', start_quality: quality, end_quality: quality };
+  const charging = data.charging && typeof data.charging === 'object' ? data.charging : {};
+  const endpoints = (Array.isArray(charging.endpoints) ? charging.endpoints : [])
+    .map((e, i) => checkedRecord(e, endpointSchema, `charging endpoint ${i + 1}`));
+  endpoints.forEach((e, i) => {
+    if (!e.record_start) throw new Error(`charging endpoint ${i + 1} has no record_start`);
+    if ((e.start_soc != null && !e.start_observed_at) || (e.end_soc != null && !e.end_observed_at)) {
+      throw new Error(`charging endpoint ${i + 1} has a SOC without its time`);
+    }
+  });
+
+  const baselineDate = typeof data.analysis.baseline_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.analysis.baseline_date)
+    ? data.analysis.baseline_date : undefined;
+  return { perRide, baselineDate, endpoints };
+}
+
+// Replace currentData with a validated dataset. Only rides and charging endpoints are taken over:
+// everything derived from them is recomputed here, and the models by recomputeModelFromInclusions().
+function loadSanitizedDataset(clean) {
+  currentData = { analysis: { per_ride: clean.perRide, models: {}, baseline_date: clean.baselineDate } };
+  rebuildDerivedAnalytics(clean.endpoints);
+}
+
+function sanitizeBikeSettings(s) {
+  if (!s || typeof s !== 'object') return null;
+  const text = (v, fallback) => (typeof v === 'string' ? v.slice(0, 120) : fallback);
+  const positive = (v, fallback) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : fallback);
+  return {
+    bikeModel: text(s.bikeModel, bikeSettings.bikeModel),
+    motor: text(s.motor, bikeSettings.motor),
+    nominalWh: positive(s.nominalWh, bikeSettings.nominalWh),
+    baselineDate: typeof s.baselineDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s.baselineDate) ? s.baselineDate : bikeSettings.baselineDate,
+    baselinePct: positive(s.baselinePct, bikeSettings.baselinePct),
+    unit: s.unit === 'mi' || s.unit === 'km' ? s.unit : bikeSettings.unit
+  };
+}
+
+function sanitizeInclusions(obj) {
+  const out = {};
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return out;
+  for (const [k, v] of Object.entries(obj)) {
+    if (ISO_DATETIME_RE.test(k) && typeof v === 'boolean') out[k] = v;
+  }
+  return out;
+}
+
+/* ────────────── JSON Backup & Restore ────────────── */
+// A backup carries the bike settings and ride selections as well as the data, so restoring it in
+// another browser reproduces the same analysis. analysis/charging stay top-level, as before.
+function buildBackup() {
+  return {
+    packfade_backup_version: 2,
+    exported_at: new Date().toISOString(),
+    bike_settings: bikeSettings,
+    user_ride_inclusions: userInclusions,
+    analysis: currentData.analysis,
+    charging: currentData.charging
+  };
+}
+
+// Validates and loads a parsed backup; throws (changing nothing) if it is not a valid one.
+async function restoreBackup(parsed) {
+  const clean = sanitizeDataset(parsed);
+  loadSanitizedDataset(clean);
+  // Store the rides before the mode: a reload in between must not show the old data as personal.
+  await idbSet('ebike_data', currentData);
+  // A restored backup is the user's own data: leaving demo mode stops startup replacing it with the seed.
+  datasetMode = 'personal';
+  await idbSet('dataset_mode', 'personal');
+
+  const restoredSettings = sanitizeBikeSettings(parsed.bike_settings);
+  if (restoredSettings) {
+    bikeSettings = restoredSettings;
+    await idbSet('bike_settings', bikeSettings);
+    setUnit(bikeSettings.unit);
+    updateSettingsInputs();
+  }
+  // Selections belong to the backup's rides; a backup without them gets the default selection.
+  userInclusions = sanitizeInclusions(parsed.user_ride_inclusions);
+  await idbSet('user_ride_inclusions', userInclusions);
+
+  await recomputeModelFromInclusions(); // refits, saves ebike_data and renders
+  updateDatasetModeDisplay();
+  return { restoredSettings: !!restoredSettings };
 }
 
 /* ────────────── IndexedDB Database Management ────────────── */
@@ -2631,28 +2912,38 @@ function updateSyncProgress(step, percent, message, detail = '', isDone = false,
 
 async function mergeSyncedData(syncedData) {
   if (!syncedData) return;
+  let synced;
+  try {
+    synced = sanitizeDataset(syncedData);
+  } catch (err) {
+    updateSyncProgress('error', 0, 'Bridge data rejected: ' + err.message, err.message, true, true);
+    return;
+  }
   if (!currentData || !currentData.analysis || datasetMode === 'demo') {
     // Never mix real rides into the anonymised demo sample: the device data replaces it.
-    currentData = syncedData;
+    loadSanitizedDataset(synced);
     datasetMode = 'personal';
     userInclusions = {};
     await idbSet('dataset_mode', 'personal');
     await idbSet('user_ride_inclusions', {});
     updateDatasetModeDisplay();
   } else {
+    // Rides already in the browser win; charging gaps are then rebuilt over the merged ride list.
     const existingDates = new Set((currentData.analysis.per_ride || []).map(r => r.date.slice(0, 19)));
-    const newRides = (syncedData.analysis && syncedData.analysis.per_ride) ? syncedData.analysis.per_ride : [];
-    for (const r of newRides) {
+    const endpointsByKey = new Map(((currentData.charging && currentData.charging.endpoints) || [])
+      .map(e => [rideKey(e.record_start), e]));
+    for (const r of synced.perRide) {
       const k = r.date.slice(0, 19);
       if (!existingDates.has(k)) {
         currentData.analysis.per_ride.push(r);
         existingDates.add(k);
       }
     }
-    currentData.analysis.per_ride.sort((a, b) => new Date(a.date) - new Date(b.date));
-    if (syncedData.charging) {
-      currentData.charging = syncedData.charging;
+    for (const e of synced.endpoints) {
+      const k = rideKey(e.record_start);
+      if (!endpointsByKey.has(k)) endpointsByKey.set(k, e);
     }
+    rebuildDerivedAnalytics(Array.from(endpointsByKey.values()));
   }
   // Refit models using the client-side Huber-WLS engine
   await recomputeModelFromInclusions();
@@ -2942,10 +3233,7 @@ function renderRideTable() {
     if (isIncluded) totalIncluded++;
 
     const dateStr = escapeHtml(r.date.slice(0, 10));
-    const reasonStr = (r.reasons || []).join(' ').toLowerCase();
-    const searchTarget = `${dateStr} ${reasonStr} ${isOrigClean ? 'clean usable' : 'excluded'} ${isIncluded ? 'included' : ''}`.toLowerCase();
-
-    if (query && !searchTarget.includes(query)) {
+    if (!rideMatchesSearch(r, query)) {
       continue;
     }
     visibleCount++;
@@ -2973,7 +3261,7 @@ function renderRideTable() {
     // Status / Reason Badge
     let statusBadge = '';
     const glitchPill = (r.masked_50_glitches && r.masked_50_glitches > 0)
-      ? `<span class="badge" style="background:var(--cyan-soft); color:var(--cyan); border:1px solid oklch(0.78 0.13 225 / 0.35); font-size:10px; margin-left:4px;" title="Automatic ANT+ LEV 50% reconnection glitch rectification applied (${r.masked_50_glitches}s placeholder scrubbed)">50% Rectified</span>`
+      ? `<span class="badge" style="background:var(--cyan-soft); color:var(--cyan); border:1px solid oklch(0.78 0.13 225 / 0.35); font-size:10px; margin-left:4px;" title="Automatic ANT+ LEV 50% reconnection glitch rectification applied (${escapeHtml(r.masked_50_glitches)}s placeholder scrubbed)">50% Rectified</span>`
       : '';
 
     const shortTag = currentUnit === 'mi' ? '<5mi' : '<8km';
@@ -3065,7 +3353,7 @@ function showRideDetails(ride) {
       <div><strong>Date:</strong> ${escapeHtml(ride.date.slice(0,19).replace('T', ' '))} UTC</div>
       <div><strong>Model Status:</strong> <span class="badge ${isIncluded ? (isClean ? 'success' : 'manual') : 'danger'}">${isIncluded ? (isClean ? 'Active in Fit (Clean)' : 'Active in Fit (Manual Override)') : 'Excluded from Fit'}</span></div>
       <div><strong>Distance:</strong> ${uDist != null ? uDist.toFixed(2) : '—'} ${distUnitLabel()}</div>
-      <div><strong>SOC Depletion:</strong> ${ride.start_soc ?? '—'}% &rarr; ${ride.end_soc ?? '—'}% (${ride.drop_pp != null ? ride.drop_pp : '—'} pp)</div>
+      <div><strong>SOC Depletion:</strong> ${escapeHtml(ride.start_soc ?? '—')}% &rarr; ${escapeHtml(ride.end_soc ?? '—')}% (${escapeHtml(ride.drop_pp ?? '—')} pp)</div>
       <div><strong>Consumption Rate:</strong> ${uRate != null ? uRate.toFixed(3) : '—'} ${rateUnitLabel()}</div>
       <div><strong>Est. Equivalent Range:</strong> ${uRange != null ? uRange.toFixed(1) : '—'} ${distUnitLabel()}</div>
       <div><strong>Equilibrated Temp:</strong> ${ride.temperature_c != null ? ride.temperature_c.toFixed(1) : '—'} &deg;C</div>
@@ -3077,7 +3365,7 @@ function showRideDetails(ride) {
       <div style="background:var(--cyan-soft); border:1px solid oklch(0.78 0.13 225 / 0.35); border-radius:6px; padding:10px; color:#fff; margin-bottom:14px; font-size:12px;">
         <strong style="color:var(--cyan); display:block; margin-bottom:4px;">ANT+ LEV 50% Reconnection Glitch Rectified:</strong>
         <p style="line-height:1.5; color:var(--fg);">
-          During a mid-ride pause or signal drop, the bike auto-powered down. When waking up, the Garmin Edge briefly recorded an uninitialized 50% fallback (${ride.masked_50_glitches} sample${ride.masked_50_glitches > 1 ? 's' : ''}) before real-time SoC frames re-established. This digital artifact was automatically scrubbed to preserve accurate endpoint discharge (${ride.drop_pp != null ? ride.drop_pp : '—'} pp over ${uDist != null ? uDist.toFixed(1) : '—'} ${distUnitLabel()}).
+          During a mid-ride pause or signal drop, the bike auto-powered down. When waking up, the Garmin Edge briefly recorded an uninitialized 50% fallback (${escapeHtml(ride.masked_50_glitches)} sample${ride.masked_50_glitches > 1 ? 's' : ''}) before real-time SoC frames re-established. This digital artifact was automatically scrubbed to preserve accurate endpoint discharge (${escapeHtml(ride.drop_pp ?? '—')} pp over ${uDist != null ? uDist.toFixed(1) : '—'} ${distUnitLabel()}).
         </p>
       </div>
     ` : ''}
@@ -3215,12 +3503,12 @@ function handleChartHover(mouseX, mouseY) {
       const isInc = closest.isIncluded;
       const statusLabel = isInc ?
         '<span style="color:var(--emerald); font-weight:600;">(Included in Fit)</span>' :
-        `<span style="color:var(--bad); font-weight:600;">(Excluded: ${closest.r.reasons && closest.r.reasons.length ? closest.r.reasons[0].replace(/_/g, ' ') : 'manual'})</span>`;
+        `<span style="color:var(--bad); font-weight:600;">(Excluded: ${escapeHtml(closest.r.reasons && closest.r.reasons.length ? closest.r.reasons[0].replace(/_/g, ' ') : 'manual')})</span>`;
       const uRate = toUserRate(closest.r.pp_per_km);
       const uRange = toUserDist(closest.r.equivalent_range_km);
       const uDist = toUserDist(closest.r.km);
       tooltip.innerHTML = `
-        <div class="tt-title">${closest.r.date.slice(0, 10)} ${statusLabel}</div>
+        <div class="tt-title">${escapeHtml(closest.r.date.slice(0, 10))} ${statusLabel}</div>
         <div>Rate: <strong>${uRate != null ? uRate.toFixed(2) : '—'} ${rateUnitLabel()}</strong></div>
         <div>Temp: <strong>${closest.r.temperature_c ? closest.r.temperature_c.toFixed(1) : '—'}°C</strong></div>
         <div>Range: <strong>${uRange != null ? uRange.toFixed(1) : '—'} ${distUnitLabel()}</strong></div>
@@ -4444,7 +4732,8 @@ function setupEventListeners() {
   // JSON Export
   document.getElementById('btnExportJson').onclick = () => {
     if (!currentData) return;
-    const blob = new Blob([JSON.stringify(currentData, null, 2)], { type: 'application/json' });
+    const backup = buildBackup();
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -4474,22 +4763,20 @@ function setupEventListeners() {
   document.getElementById('importJsonInput').onchange = (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    e.target.value = ''; // allow restoring the same file again
     const reader = new FileReader();
     reader.onload = async (evt) => {
+      let result;
       try {
-        const parsed = JSON.parse(evt.target.result);
-        if (parsed.analysis) {
-          currentData = parsed;
-          await idbSet('ebike_data', currentData);
-          renderDashboard();
-          alert('Database restored successfully from JSON backup!');
-          document.getElementById('dataModalOverlay').classList.remove('open');
-        } else {
-          alert('Invalid Packfade JSON structure.');
-        }
+        result = await restoreBackup(JSON.parse(evt.target.result));
       } catch (err) {
-        alert('Failed to parse JSON file: ' + err.message);
+        alert('This file is not a valid Packfade backup: ' + err.message);
+        return;
       }
+      alert(result.restoredSettings
+        ? 'Database restored successfully from JSON backup, with its bike settings and ride selections.'
+        : 'Database restored from JSON backup. This older backup has no bike settings or ride selections: the current bike settings and the default ride selection are used.');
+      document.getElementById('dataModalOverlay').classList.remove('open');
     };
     reader.readAsText(file);
   };
@@ -4645,14 +4932,26 @@ function setupEventListeners() {
     }
   };
 
+  // Returns null for a file that is not FIT at all, and throws for a FIT file that is truncated or
+  // corrupt: a partial ride must never be accepted as a clean, shorter one (AGENTS.md Rule 3).
   function parseFitActivity(buffer) {
-    if (buffer.length < 14) return null;
+    if (buffer.length < 12) return null;
     const headerSize = buffer[0];
     const magic = String.fromCharCode(buffer[8], buffer[9], buffer[10], buffer[11]);
     if (magic !== '.FIT') return null;
-    const dataSize = buffer[4] | (buffer[5] << 8) | (buffer[6] << 16) | (buffer[7] << 24);
+    if (headerSize < 12 || headerSize > buffer.length) throw new Error(`corrupt FIT header (header size ${headerSize})`);
+    const dataSize = (buffer[4] | (buffer[5] << 8) | (buffer[6] << 16) | (buffer[7] << 24)) >>> 0;
+    const endOffset = headerSize + dataSize;
+    if (endOffset + 2 > buffer.length) {
+      throw new Error(`truncated FIT file (${buffer.length} of ${endOffset + 2} bytes)`);
+    }
+    if (headerSize >= 14 && (buffer[12] | (buffer[13] << 8)) !== 0 && fitCrc(buffer, 0, 14) !== 0) {
+      throw new Error('FIT header CRC mismatch');
+    }
+    if (fitCrc(buffer, 0, endOffset + 2) !== 0) {
+      throw new Error('FIT file CRC mismatch (corrupt or incomplete copy)');
+    }
     let offset = headerSize;
-    const endOffset = Math.min(buffer.length, headerSize + dataSize);
     const defs = {};
     const records = [];
     let totalAscent = null;
@@ -4664,12 +4963,17 @@ function setupEventListeners() {
     const readU32BE = (o) => ((buffer[o] << 24) | (buffer[o+1] << 16) | (buffer[o+2] << 8) | buffer[o+3]) >>> 0;
     const readS8 = (o) => { const v = buffer[o]; return v > 127 ? v - 256 : v; };
 
-    while (offset < endOffset && offset < buffer.length - 2) {
+    const corrupt = (what) => new Error(`corrupt FIT data: ${what} at byte ${offset}`);
+    const need = (n, what) => { if (offset + n > endOffset) throw corrupt(`${what} runs past the end of the data`); };
+
+    while (offset < endOffset) {
       const header = buffer[offset++];
       if ((header & 0x80) !== 0) {
         const localMsgType = (header >> 5) & 0x03;
         const def = defs[localMsgType];
-        if (def) offset += def.dataSize;
+        if (!def) throw corrupt(`compressed-timestamp message for undefined local type ${localMsgType}`);
+        need(def.dataSize, 'message');
+        offset += def.dataSize;
         continue;
       }
       const isDefinition = (header & 0x40) !== 0;
@@ -4677,12 +4981,14 @@ function setupEventListeners() {
       const localMsgType = header & 0x0F;
 
       if (isDefinition) {
+        need(5, 'definition');
         offset++; // reserved
         const arch = buffer[offset++];
         const isLE = (arch === 0);
         const globalMsgNum = isLE ? readU16LE(offset) : readU16BE(offset);
         offset += 2;
         const numFields = buffer[offset++];
+        need(3 * numFields, 'definition');
         const fields = [];
         let totalSize = 0;
         for (let i = 0; i < numFields; i++) {
@@ -4693,7 +4999,9 @@ function setupEventListeners() {
           totalSize += size;
         }
         if (hasDevData) {
+          need(1, 'definition');
           const numDevFields = buffer[offset++];
+          need(3 * numDevFields, 'definition');
           for (let i = 0; i < numDevFields; i++) {
             offset += 3;
             const devSize = buffer[offset - 2];
@@ -4703,7 +5011,8 @@ function setupEventListeners() {
         defs[localMsgType] = { globalMsgNum, isLE, fields, dataSize: totalSize };
       } else {
         const def = defs[localMsgType];
-        if (!def) break;
+        if (!def) throw corrupt(`data message for undefined local type ${localMsgType}`);
+        need(def.dataSize, 'message');
         if (def.globalMsgNum === 20) { // Record
           let fOffset = offset;
           let timestamp = null, distance = null, battery = null, temp = null, speed = null, mode = null, power = null;
@@ -4734,7 +5043,7 @@ function setupEventListeners() {
             }
             fOffset += f.size;
           }
-          if (timestamp !== null) {
+          if (timestamp !== null && timestamp !== 0xFFFFFFFF) {
             records.push({ timestamp, distance, battery, temp, speed, mode, power });
           }
         } else if (def.globalMsgNum === 18) { // Session
@@ -4757,6 +5066,21 @@ function setupEventListeners() {
       records.sort((a, b) => a.timestamp - b.timestamp);
     }
     return { records, totalAscent, totalDistSession };
+  }
+
+  // FIT CRC-16 (FIT SDK nibble-table algorithm) over buffer[start, end).
+  const FIT_CRC_TABLE = [0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,
+                         0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400];
+  function fitCrc(buffer, start, end) {
+    let crc = 0;
+    for (let i = start; i < end; i++) {
+      const byte = buffer[i];
+      let tmp = FIT_CRC_TABLE[crc & 0xF];
+      crc = ((crc >> 4) & 0x0FFF) ^ tmp ^ FIT_CRC_TABLE[byte & 0xF];
+      tmp = FIT_CRC_TABLE[crc & 0xF];
+      crc = ((crc >> 4) & 0x0FFF) ^ tmp ^ FIT_CRC_TABLE[(byte >> 4) & 0xF];
+    }
+    return crc;
   }
 
   function maskBracketed50Glitches(times, socs) {
@@ -4787,6 +5111,60 @@ function setupEventListeners() {
     return mask;
   }
 
+  const FIT_EPOCH_OFFSET_S = 631065600; // 1989-12-31T00:00:00Z
+  const fitTimeIso = (t) => new Date((t + FIT_EPOCH_OFFSET_S) * 1000).toISOString();
+
+  // Per-recording SOC endpoints for the charging and idle-gap analysis; same rules as extract() in
+  // scripts/analyze_ebike_charging.py. Uses every battery reading, so it works for rides that the
+  // consumption filters exclude (short rides, missing distance).
+  function chargingEndpointFromRecords(records) {
+    const times = records.map(r => r.timestamp);
+    const raw = records.map(r => r.battery);
+    const suspect = maskBracketed50Glitches(times, raw);
+    const soc = raw.map((v, i) => suspect[i] ? null : v);
+    const indices = [];
+    soc.forEach((v, i) => { if (v != null) indices.push(i); });
+    const t0 = times[0];
+    const ep = {
+      id: fitTimeIso(t0),
+      record_start: fitTimeIso(t0),
+      record_end: fitTimeIso(times[times.length - 1]),
+      glitch_samples_masked: suspect.reduce((a, b) => a + b, 0),
+      start_soc: null, end_soc: null,
+      start_quality: 'missing', end_quality: 'missing'
+    };
+    if (!indices.length) return ep;
+    const first = indices[0];
+    const last = indices[indices.length - 1];
+    const sides = [
+      ['start', first, i => times[i] >= times[first] && times[i] <= times[first] + 30, times[first] - t0],
+      ['end', last, i => times[i] >= times[last] - 30 && times[i] <= times[last], times[times.length - 1] - times[last]]
+    ];
+    for (const [side, idx, inWindow, offsetS] of sides) {
+      const vals = [], temps = [];
+      records.forEach((r, i) => {
+        if (!inWindow(i)) return;
+        if (soc[i] != null) vals.push(soc[i]);
+        if (r.temp != null) temps.push(r.temp);
+      });
+      temps.sort((a, b) => a - b);
+      const mid = Math.floor(temps.length / 2);
+      ep[`${side}_soc`] = soc[idx];
+      ep[`${side}_observed_at`] = fitTimeIso(times[idx]);
+      ep[`${side}_offset_seconds`] = offsetS;
+      ep[`${side}_quality`] = (offsetS <= 60 && Math.max(...vals) - Math.min(...vals) <= 2) ? 'usable' : 'uncertain';
+      ep[`${side}_temperature_c`] = temps.length ? (temps.length % 2 ? temps[mid] : (temps[mid - 1] + temps[mid]) / 2) : null;
+    }
+    let rises = 0;
+    for (let k = 1; k < indices.length; k++) if (soc[indices[k]] - soc[indices[k - 1]] >= 3) rises++;
+    ep.residual_soc_rises_at_least_3pp = rises;
+    ep.recorded_drop_pp = soc[first] - soc[last];
+    ep.km = (records[first].distance != null && records[last].distance != null)
+      ? (records[last].distance - records[first].distance) / 1000 : null;
+    ep.soc_span_hours = (times[last] - times[first]) / 3600;
+    return ep;
+  }
+
   function processFitToRide(buffer) {
     const parsed = parseFitActivity(buffer);
     if (!parsed) return null;
@@ -4795,8 +5173,8 @@ function setupEventListeners() {
     if (!batteryRecords.length) return null;
     // A ride is identified by its recording start (first timestamped record), as in the Python
     // importer, so the same file always gets the same key whichever path imported it.
-    const recordStart = Math.min(...records.filter(r => r.timestamp != null).map(r => r.timestamp));
-    const recordStartIso = new Date((recordStart + 631065600) * 1000).toISOString();
+    const recordStartIso = fitTimeIso(records[0].timestamp);
+    const chargingEndpoint = chargingEndpointFromRecords(records);
 
     const valid = records.filter(r => r.timestamp != null && r.distance != null && r.battery != null);
     if (valid.length < 2) {
@@ -4813,7 +5191,8 @@ function setupEventListeners() {
         mode7_fraction: null,
         mode5_fraction: null,
         mode3_fraction: null,
-        mode2_fraction: null
+        mode2_fraction: null,
+        charging_endpoint: chargingEndpoint
       };
     }
 
@@ -4821,6 +5200,7 @@ function setupEventListeners() {
     const socs = valid.map(r => r.battery);
     const glitchMask = maskBracketed50Glitches(times, socs);
     const cleanValid = valid.filter((_, i) => !glitchMask[i]);
+    const maskedRecords = new Set(valid.filter((_, i) => glitchMask[i]));
     const maskedGlitchesCount = glitchMask.reduce((a, b) => a + b, 0);
 
     const startRec = cleanValid[0];
@@ -4829,14 +5209,14 @@ function setupEventListeners() {
     const drop = startRec.battery - endRec.battery;
 
     let deltaRebounds = 0;
-    let hasJump3pp = false;
+    let upwardJumps = 0;
     let hasDistReset = false;
     let largestJump = 0;
 
     for (let i = 1; i < cleanValid.length; i++) {
       const dSoc = cleanValid[i].battery - cleanValid[i-1].battery;
       const dDist = cleanValid[i].distance - cleanValid[i-1].distance;
-      if (dSoc >= 3) hasJump3pp = true;
+      if (dSoc >= 3) upwardJumps++;
       if (dSoc > largestJump) largestJump = dSoc;
       if (dSoc > 0) deltaRebounds += dSoc;
       if (dDist < -0.1) hasDistReset = true;
@@ -4845,37 +5225,44 @@ function setupEventListeners() {
     const reasons = [];
     if (km < 8) reasons.push('distance_under_8km');
     if (drop < 15) reasons.push('battery_drop_under_15pp');
-    if (hasJump3pp) reasons.push('upward_battery_jump_at_least_3pp');
+    if (upwardJumps > 0) reasons.push('upward_battery_jump_at_least_3pp');
     if (hasDistReset) reasons.push('distance_reset');
     if (deltaRebounds > 2) reasons.push('battery_rebounds_over_2pp_total');
 
+    // Time weights run over every record between the discharge endpoints, as in extract(): each
+    // interval up to 10 s is weighted by its length, and only counts towards battery coverage if the
+    // record starting it has a battery reading. Gaps in telemetry therefore lower the coverage.
     const t0 = startRec.timestamp;
     const totalSpan = Math.max(1, endRec.timestamp - startRec.timestamp);
+    const firstIdx = records.indexOf(startRec);
+    const lastIdx = records.indexOf(endRec);
     let validBatteryTime = 0;
-    let sumWeight = 0, sumWeight10m = 0;
+    let sumTempWeight = 0, sumTempWeight10m = 0;
     let weightedTemp = 0, weightedTemp10m = 0;
     let weightedSpeed = 0, sumSpeedWeight = 0;
-    let weightedMeanSoc = 0;
+    let weightedMeanSoc = 0, sumSocWeight = 0;
     let modeWeights = { 7: 0, 5: 0, 3: 0, 2: 0 };
-    let sumModeWeight = 0;
     let totalModeSeconds = 0;
 
-    for (let i = 0; i < cleanValid.length - 1; i++) {
-      const cur = cleanValid[i];
-      const nxt = cleanValid[i+1];
+    for (let i = firstIdx; i < lastIdx; i++) {
+      const cur = records[i];
+      const nxt = records[i+1];
       const dt = nxt.timestamp - cur.timestamp;
       if (dt <= 0 || dt > 10) continue;
 
       if (cur.battery != null) {
         validBatteryTime += dt;
-        weightedMeanSoc += dt * cur.battery;
+        if (!maskedRecords.has(cur)) {
+          weightedMeanSoc += dt * cur.battery;
+          sumSocWeight += dt;
+        }
       }
-      sumWeight += dt;
       if (cur.temp != null) {
         weightedTemp += dt * cur.temp;
+        sumTempWeight += dt;
         if (cur.timestamp >= t0 + 600) {
           weightedTemp10m += dt * cur.temp;
-          sumWeight10m += dt;
+          sumTempWeight10m += dt;
         }
       }
       if (cur.speed != null && cur.speed > 1.0) { // > 1 m/s (3.6 km/h) aligned with Python
@@ -4896,9 +5283,10 @@ function setupEventListeners() {
       reasons.push("battery_time_coverage_under_90pct");
     }
 
-    const tempFinal = sumWeight10m > 0 ? (weightedTemp10m / sumWeight10m) : (sumWeight > 0 ? (weightedTemp / sumWeight) : null);
+    // Weighted means over recorded values only: a ride without temperature has no temperature.
+    const tempFinal = sumTempWeight10m > 0 ? (weightedTemp10m / sumTempWeight10m) : (sumTempWeight > 0 ? (weightedTemp / sumTempWeight) : null);
     const speedFinal = sumSpeedWeight > 0 ? (weightedSpeed / sumSpeedWeight) : null;
-    const meanSocFinal = validBatteryTime > 0 ? (weightedMeanSoc / validBatteryTime) : null;
+    const meanSocFinal = sumSocWeight > 0 ? (weightedMeanSoc / sumSocWeight) : null;
 
     const hasModes = totalModeSeconds > 0;
     const mode7 = hasModes ? (modeWeights[7] / totalModeSeconds) : null;
@@ -4919,7 +5307,7 @@ function setupEventListeners() {
       drop_pp: drop,
       start_soc: startRec.battery,
       end_soc: endRec.battery,
-      upward_jumps: hasJump3pp ? 1 : 0,
+      upward_jumps: upwardJumps,
       largest_upward_jump_pp: largestJump,
       masked_50_glitches: maskedGlitchesCount,
       pp_per_km: km > 0 ? (drop / km) : null,
@@ -4934,7 +5322,8 @@ function setupEventListeners() {
       mode2_fraction: mode2,
       ascent_m_per_km: ascentMPerKm,
       battery_time_coverage: coverage,
-      quantization_weight: 1.0 / (0.05**2 + 1.0 / (6.0 * (Math.max(1, drop)**2)))
+      quantization_weight: 1.0 / (0.05**2 + 1.0 / (6.0 * (Math.max(1, drop)**2))),
+      charging_endpoint: chargingEndpoint
     };
   }
 
@@ -5044,29 +5433,46 @@ function setupEventListeners() {
 
     const existingByDate = new Map();
     currentData.analysis.per_ride.forEach(r => existingByDate.set(r.date.slice(0, 19), r));
+    const knownDates = new Set(existingByDate.keys());
+    const endpointsByKey = new Map(((currentData.charging && currentData.charging.endpoints) || [])
+      .map(e => [rideKey(e.record_start), e]));
 
-    let importedCount = 0;
+    let addedCount = 0;
+    let alreadyPresentCount = 0;
     let filteredCount = 0;
     let noBatteryCount = 0;
+    let rejectedCount = 0;
+    const fmtKm = km => (km != null ? `${km.toFixed(1)} km` : 'no distance');
 
     for (let i = 0; i < fitFiles.length; i++) {
       const file = fitFiles[i];
       const buf = new Uint8Array(await file.arrayBuffer());
-      const ride = processFitToRide(buf);
+      let ride;
+      try {
+        ride = processFitToRide(buf);
+      } catch (err) {
+        rejectedCount++;
+        appendSyncConsole(`[REJECTED] ${file.name} -> ${err.message}; not imported`, 'warn');
+      }
 
-      if (!ride) {
+      if (ride === null) {
         noBatteryCount++;
         appendSyncConsole(`[SKIP] ${file.name} -> No e-bike battery telemetry found`, 'warn');
-      } else {
+      } else if (ride) {
         const dateKey = ride.date.slice(0, 19);
+        endpointsByKey.set(dateKey, ride.charging_endpoint);
+        delete ride.charging_endpoint;
         existingByDate.set(dateKey, ride);
+        const isNew = !knownDates.has(dateKey);
+        knownDates.add(dateKey);
         if (!ride.reasons || ride.reasons.length === 0) {
-          importedCount++;
+          if (isNew) addedCount++; else alreadyPresentCount++;
           const glitchMsg = ride.masked_50_glitches > 0 ? ` (scrubbed ${ride.masked_50_glitches} 50% glitch)` : '';
-          appendSyncConsole(`[OK] ${ride.date.slice(0, 10)}: ${ride.km.toFixed(1)} km, -${ride.drop_pp}% SoC${glitchMsg}`, 'highlight');
+          const dupMsg = isNew ? '' : ' [already in database, updated]';
+          appendSyncConsole(`[OK] ${ride.date.slice(0, 10)}: ${fmtKm(ride.km)}, -${ride.drop_pp}% SoC${glitchMsg}${dupMsg}`, 'highlight');
         } else {
           filteredCount++;
-          appendSyncConsole(`[FILTERED] ${ride.date.slice(0, 10)}: ${ride.km.toFixed(1)} km (${ride.reasons.join(', ')})`, '');
+          appendSyncConsole(`[FILTERED] ${ride.date.slice(0, 10)}: ${fmtKm(ride.km)} (${ride.reasons.join(', ')})`, '');
         }
       }
 
@@ -5074,39 +5480,27 @@ function setupEventListeners() {
       updateSyncProgress('filter', pct, `Processing ${i + 1} of ${fitFiles.length} files...`);
     }
 
-    // Sort all rides chronologically
-    const allRides = Array.from(existingByDate.values()).sort((a, b) => new Date(a.date) - new Date(b.date));
-
-    // Recompute cumulative drop and EFC
-    let cumDrop = 0;
-    for (const r of allRides) {
-      if (!r.reasons || r.reasons.length === 0) {
-        cumDrop += r.drop_pp;
-        r.cumulative_drop_pp = cumDrop;
-        r.cumulative_efc = cumDrop / 100.0;
-      } else {
-        r.cumulative_drop_pp = null;
-        r.cumulative_efc = null;
-      }
-    }
-
-    currentData.analysis.per_ride = allRides;
-    currentData.analysis.rides_imported = allRides.length;
-    currentData.analysis.rides_usable = allRides.filter(r => !r.reasons || r.reasons.length === 0).length;
+    currentData.analysis.per_ride = Array.from(existingByDate.values());
+    rebuildDerivedAnalytics(Array.from(endpointsByKey.values()));
+    const allRides = currentData.analysis.per_ride;
 
     updateSyncProgress('model', 96, 'Refitting Huber-WLS degradation models in browser...', 'Solving multi-covariate system and cluster bootstrap');
     await recomputeModelFromInclusions();
-    if (importedCount > 0 && datasetMode === 'demo') {
+    if (addedCount > 0 && datasetMode === 'demo') {
       datasetMode = 'personal';
       await idbSet('dataset_mode', 'personal');
     }
     await idbSet('ebike_data', currentData);
     renderDashboard();
 
+    const summary = [`${addedCount} new clean rides added`];
+    if (alreadyPresentCount) summary.push(`${alreadyPresentCount} already in database`);
+    summary.push(`${filteredCount} filtered`, `${noBatteryCount} skipped`);
+    if (rejectedCount) summary.push(`${rejectedCount} rejected as corrupt`);
     updateSyncProgress(
       'complete',
       100,
-      `Import Complete: ${importedCount} clean rides added, ${filteredCount} filtered, ${noBatteryCount} skipped`,
+      `Import Complete: ${summary.join(', ')}`,
       `Database now has ${allRides.length} total activities. Models refitted purely in browser.`,
       true,
       false

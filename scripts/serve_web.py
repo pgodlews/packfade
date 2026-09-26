@@ -4,17 +4,24 @@
 Serves the zero-install web UI and provides optional local USB bridge
 endpoints for the connected Garmin Edge device.
 """
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import queue
 import re
+import signal
 import subprocess
 import sys
+import threading
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIR = ROOT / "web"
 REPORTS_DIR = ROOT / "reports/ebike_battery"
+STEP_TIMEOUT_S = 180
+# One device sync at a time: the threaded server keeps serving the UI while a sync runs.
+SYNC_LOCK = threading.Lock()
 
 
 def get_device_status():
@@ -58,6 +65,58 @@ def get_latest_data():
     return {"analysis": analysis, "charging": charging}
 
 
+def stop_process(proc):
+    """Kill a sync step and everything it started (e.g. pull_edge under the importer)."""
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)  # the step runs in its own session/process group
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()
+
+
+def run_streamed(cmd, on_line, timeout=STEP_TIMEOUT_S):
+    """Run cmd, calling on_line for each non-empty output line; return (returncode, last five lines).
+
+    The deadline covers the whole step, including a child that stalls with stdout still open:
+    lines are read on a helper thread, so waiting for the next line is itself bounded. On timeout
+    (or any error) the child's process group is killed, and TimeoutExpired is raised.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            start_new_session=hasattr(os, "killpg"))
+    lines = queue.Queue()
+
+    def pump():
+        for raw in iter(proc.stdout.readline, ""):
+            lines.put(raw)
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+    deadline = time.monotonic() + timeout
+    last_lines = []
+    finished = False
+    try:
+        while True:
+            try:
+                raw = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                raise subprocess.TimeoutExpired(cmd, timeout) from None
+            if raw is None:
+                break
+            line = raw.strip()
+            if line:
+                last_lines = (last_lines + [line])[-5:]
+                on_line(line)
+        code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        finished = True
+        return code, last_lines
+    finally:
+        if not finished:
+            stop_process(proc)
+
+
 def sync_device():
     py = ROOT / ".venv/bin/python"
     if not py.exists():
@@ -65,13 +124,13 @@ def sync_device():
     try:
         # 1. Run import ebike history
         p1 = subprocess.run([str(py), str(ROOT / "scripts/import_ebike_history.py")],
-                            capture_output=True, text=True, check=True, timeout=180)
+                            capture_output=True, text=True, check=True, timeout=STEP_TIMEOUT_S)
         # 2. Run analyze battery
         p2 = subprocess.run([str(py), str(ROOT / "scripts/analyze_ebike_battery.py")],
-                            capture_output=True, text=True, check=True, timeout=180)
+                            capture_output=True, text=True, check=True, timeout=STEP_TIMEOUT_S)
         # 3. Run analyze charging
         p3 = subprocess.run([str(py), str(ROOT / "scripts/analyze_ebike_charging.py")],
-                            capture_output=True, text=True, check=True, timeout=180)
+                            capture_output=True, text=True, check=True, timeout=STEP_TIMEOUT_S)
 
         return {
             "success": True,
@@ -170,19 +229,14 @@ class PackfadeHandler(SimpleHTTPRequestHandler):
         device_label = dev_info.get("device", "Garmin Device") if dev_info.get("connected") else "Garmin Edge"
         send("connect", 3, f"Connecting to {device_label} over USB MTP...", "Checking device connection")
 
+        if not SYNC_LOCK.acquire(blocking=False):
+            send("error", 0, "A device sync is already running", done=True, error="Sync already in progress")
+            return
         try:
             # Step 1: Import activities & filter battery info
             send("transfer", 8, f"Reading activity files from {device_label}...", "Running pull_edge")
-            cmd1 = [str(py), "-u", str(ROOT / "scripts/import_ebike_history.py")]
-            p1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-            last_lines = []
-            for raw_line in iter(p1.stdout.readline, ''):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                last_lines.append(line)
-                if len(last_lines) > 5:
-                    last_lines.pop(0)
+
+            def on_import_line(line):
                 if "Copied" in line:
                     m = re.search(r"Copied (\d+) activities", line)
                     if m:
@@ -202,47 +256,29 @@ class PackfadeHandler(SimpleHTTPRequestHandler):
                 else:
                     send("transfer", 20, line, line)
 
-            p1.wait(timeout=180)
-            if p1.returncode != 0:
+            code, last_lines = run_streamed([str(py), "-u", str(ROOT / "scripts/import_ebike_history.py")], on_import_line)
+            if code != 0:
                 err_detail = " | ".join(last_lines) or "Import failed"
                 send("error", 0, "Garmin USB import encountered an error", detail=err_detail, done=True, error=err_detail)
                 return
 
             # Step 2: Battery Degradation Modeling
             send("modeling", 70, "Fitting battery degradation trend models (Huber-WLS + bootstrap)...", "Huber IRLS regression")
-            cmd2 = [str(py), "-u", str(ROOT / "scripts/analyze_ebike_battery.py")]
-            p2 = subprocess.Popen(cmd2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-            last_lines2 = []
-            for raw_line in iter(p2.stdout.readline, ''):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                last_lines2.append(line)
-                if len(last_lines2) > 5:
-                    last_lines2.pop(0)
-                send("modeling", 78, "Fitting bootstrap iterations for 95% confidence bands...", line)
-            p2.wait(timeout=180)
-            if p2.returncode != 0:
-                err_detail = " | ".join(last_lines2) or "Battery analysis failed"
+            code, last_lines = run_streamed(
+                [str(py), "-u", str(ROOT / "scripts/analyze_ebike_battery.py")],
+                lambda line: send("modeling", 78, "Fitting bootstrap iterations for 95% confidence bands...", line))
+            if code != 0:
+                err_detail = " | ".join(last_lines) or "Battery analysis failed"
                 send("error", 0, "Error fitting battery models", detail=err_detail, done=True, error=err_detail)
                 return
 
             # Step 3: Charging & Idle Storage Sag Analysis
             send("charging", 88, "Reconstructing charging intervals and storage idle sag...", "Classifying gaps and self-discharge")
-            cmd3 = [str(py), "-u", str(ROOT / "scripts/analyze_ebike_charging.py")]
-            p3 = subprocess.Popen(cmd3, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-            last_lines3 = []
-            for raw_line in iter(p3.stdout.readline, ''):
-                line = raw_line.strip()
-                if not line:
-                    continue
-                last_lines3.append(line)
-                if len(last_lines3) > 5:
-                    last_lines3.pop(0)
-                send("charging", 94, "Analyzing charging habits and parasitic loss...", line)
-            p3.wait(timeout=180)
-            if p3.returncode != 0:
-                err_detail = " | ".join(last_lines3) or "Charging analysis failed"
+            code, last_lines = run_streamed(
+                [str(py), "-u", str(ROOT / "scripts/analyze_ebike_charging.py")],
+                lambda line: send("charging", 94, "Analyzing charging habits and parasitic loss...", line))
+            if code != 0:
+                err_detail = " | ".join(last_lines) or "Charging analysis failed"
                 send("error", 0, "Error analyzing charging history", detail=err_detail, done=True, error=err_detail)
                 return
 
@@ -251,9 +287,12 @@ class PackfadeHandler(SimpleHTTPRequestHandler):
             rides_count = len(fresh_data.get("analysis", {}).get("per_ride", [])) if fresh_data else 0
             send("complete", 100, f"Sync complete! {rides_count} battery rides processed.", "All degradation and charging models updated", done=True, data=fresh_data)
         except subprocess.TimeoutExpired:
-            send("error", 0, "Sync step timed out after 3 minutes", done=True, error="Subprocess timeout")
+            send("error", 0, f"Sync step timed out after {STEP_TIMEOUT_S // 60} minutes; it was stopped",
+                 done=True, error="Subprocess timeout")
         except Exception as e:
             send("error", 0, str(e), done=True, error=str(e))
+        finally:
+            SYNC_LOCK.release()
 
     def do_POST(self):
         if not self.is_trusted_host():
@@ -268,7 +307,13 @@ class PackfadeHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_cors_headers()
             self.end_headers()
-            res = sync_device()
+            if SYNC_LOCK.acquire(blocking=False):
+                try:
+                    res = sync_device()
+                finally:
+                    SYNC_LOCK.release()
+            else:
+                res = {"success": False, "error": "A device sync is already running"}
             self.wfile.write(json.dumps(res).encode("utf-8"))
             return
 
@@ -289,7 +334,7 @@ def run_server(port=8080, host="127.0.0.1"):
     server = None
     for p in range(port, port + 10):
         try:
-            server = HTTPServer((host, p), PackfadeHandler)
+            server = ThreadingHTTPServer((host, p), PackfadeHandler)
             port = p
             break
         except OSError:

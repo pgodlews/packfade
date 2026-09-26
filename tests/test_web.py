@@ -167,3 +167,39 @@ def test_km_miles_unit_toggle():
     assert "function toUserRate(" in html
     assert "function toUserSpeed(" in html
     assert "packfade_unit" in html
+
+
+def test_streamed_sync_step_times_out_even_if_the_child_stalls_with_stdout_open():
+    import subprocess
+    import sys
+    import time
+    import pytest
+    from scripts.serve_web import run_streamed
+
+    # The step prints, starts a helper that inherits stdout (like pull_edge under the importer),
+    # then exits: stdout never reaches EOF, which used to block readline() with no timeout.
+    child = ("import subprocess, sys; print('started', flush=True); "
+             "p = subprocess.Popen(['sleep', '60']); print(p.pid, flush=True)")
+    lines = []
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_streamed([sys.executable, "-c", child], lines.append, timeout=1.5)
+    assert time.monotonic() - start < 10
+    assert lines[0] == "started"
+    helper_pid = int(lines[1])
+    time.sleep(0.2)
+    try:
+        state = Path(f"/proc/{helper_pid}/stat").read_text().split()[2]
+    except FileNotFoundError:
+        state = "gone"
+    assert state in ("gone", "Z"), "the stalled helper must be killed with its step"
+
+    code, last = run_streamed([sys.executable, "-c", "print('a'); print(); print('b')"], lambda line: None)
+    assert code == 0 and last == ["a", "b"]
+
+
+def test_bridge_serves_requests_while_a_sync_runs():
+    # A sync streams for minutes; a single-threaded server would block every other request.
+    source = (Path(__file__).resolve().parent.parent / "scripts/serve_web.py").read_text()
+    assert "ThreadingHTTPServer((host, p), PackfadeHandler)" in source
+    assert "HTTPServer((host, p)" not in source.replace("ThreadingHTTPServer((host, p)", "")
